@@ -103,7 +103,7 @@ gc()
 ```
 
 ```{r}
-state.omit <- c("AK", "HI", "DC", "AS", "GU", "MP", "PR", "UM", "VI","FL","MT")
+state.omit <- c("AK", "HI", "DC", "AS", "GU", "MP", "PR", "UM", "VI","FL","MT","NJ")
 conus <- fips_codes %>% filter(., !state %in% state.omit) %>% distinct(.$state) %>% c() %>% unlist()
 
 
