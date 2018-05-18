@@ -1,0 +1,113 @@
+---
+title: "Demographic Data"
+author: "Matt Williamson"
+date: "May 15, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r envPrep}
+packages = c("tigris","tidycensus","raster","fasterize","tidyverse", "sf", "velox")
+
+#use this function to check if each package is on the local machine
+#if a package is installed, it will be loaded
+#if any are not, the missing package(s) will be installed and loaded
+package.check <- lapply(packages, FUN = function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE)
+    library(x, character.only = TRUE)
+  }
+})
+
+options(tigris_use_cache = TRUE)
+census_api_key('baaaffb5ed3accd8dfa53c6f827659d43fcdfa21') #get this from the census api webpage see help(census_api_key) for details
+
+prj <- "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+outfolder <- "G:/My Drive/CONUSncedData/Census/"
+rasterOptions(tmpdir = "D:/RastTemp/", todisk=TRUE)
+```
+
+
+# Tracts
+## R Earnings functions
+I developed a custom function that downloads the median income estimate from the 1990 and 2000 Decennial Census and the 2010 and 2016 American Community Survey. The value is converted to a raster based on the geometry of interest (here the tract) and adjusted for inflation (using the CPI inflation calculator https://www.bls.gov/data/inflation_calculator.htm). I then stack these rasters and extract their values based on current Census geography
+
+```{r cars}
+get_earnings_tct <- function(st) {
+  #get state geometry for raster
+  st.poly <- tigris::states() %>%  as(.,"sf") %>% filter(., STUSPS == st)  %>% st_transform(., crs= prj ) 
+  st.rst <- fasterize::raster(st.poly, resolution=90)
+  #get 1990 earnings data
+  tct.1990 = tracts(state=st, year=1990, cb=TRUE)  %>% as(.,"sf") %>%  st_transform(., crs= prj ) %>% 
+    mutate(.,GEOID = paste0(ST, CO, TRACTBASE,TRACTSUF))
+  cty = as.vector(unique(tct.1990$COUNTYFP))
+  e.1990 = reduce(
+    map(cty, function(x) {
+      tidycensus::get_decennial(geography = "tract", year=1990, variables="P080A001", state=st, county = x)
+    }), rbind)
+   tct.1990 <- tct.1990 %>% 
+    geo_join(., e.1990, "GEOID", "GEOID")
+  rst.1990 = fasterize(tct.1990, st.rst, field="value") 
+  rst.1990.adj = round(rst.1990 * 1.8757, digits=2) #adjus for inflation base on Buerau of Labor Stats
+  names(rst.1990.adj) = "earn1990"
+  rm(rst.1990)
+#get 2000 data
+  tct.2000 = tracts(state = st, year = 2000, cb=FALSE) %>% as(.,"sf") %>%  st_transform(., crs= prj )
+  e.2000 = tidycensus::get_decennial(geography = "tract", year= 2000, sumfile="sf3",variables = "P056001", state=st)
+  tct.2000 <- tct.2000 %>%   
+      geo_join(., e.2000, "CTIDFP00", "GEOID") 
+    rst.2000 <- fasterize(tct.2000, st.rst, field="value")
+    rst.2000.adj = round(rst.2000 * 1.4054, digits=2)
+    names(rst.2000.adj) <- "earn2000"
+    rm(rst.2000)
+#get 2010 data
+    e.2010 = tidycensus::get_acs(geography = "tract", year=2010, variables = "B19049_001", state=st) 
+    tct.2010 = tracts(state = st, year = 2010, cb=FALSE) %>% 
+      geo_join(., e.2010, "GEOID10", "GEOID") %>% as(.,"sf") %>%  st_transform(., crs= prj )
+    rst.2010 <- fasterize(tct.2010, st.rst, field="estimate")
+    rst.2010.adj = round(rst.2010 * 1.0953, digits=2)
+    names(rst.2010.adj) = "earn2010"
+    rm(rst.2010)
+#get 2016 data
+    e.2016 = tidycensus::get_acs(geography = "tract", year=2016, variables = "B19049_001", state=st) 
+    tct.2016 = tracts(state = st, year = 2016, cb=FALSE) %>% 
+      geo_join(., e.2016, "GEOID", "GEOID") %>% as(.,"sf") %>%  st_transform(., crs= prj )
+    rst.2016 <- fasterize(tct.2016, st.rst, field="estimate")
+    names(rst.2016) <- "earn2016"
+ #stack and extract
+    earn.stack = raster::stack(rst.1990.adj, rst.2000.adj, rst.2010.adj, rst.2016)
+    rm(rst.1990.adj, rst.2000.adj, rst.2010.adj, rst.2016)
+    gc()
+    writeRaster(earn.stack, filename=paste0(outfolder,st,"earn.tif"), options="INTERLEAVE=BAND", overwrite=TRUE)
+    vx.stack = velox(earn.stack)
+    rm(earn.stack)
+    gc()
+    df = vx.stack$extract(sp=tct.2016, fun=NULL, df=TRUE)
+    colnames(df) <- c("ID","earn1990","earn2000", "earn2010", "earn2016")
+    id.lookup <- data.frame(ID=seq_along(tct.2016$GEOID),
+                            GEOID = tct.2016$GEOID)
+    df.lookup <- df %>% left_join(., id.lookup, by="ID") %>% 
+      gather(., key=year, value=earnings, earn1990, earn2000, earn2010, earn2016) %>% 
+      group_by(GEOID,year) %>% 
+      summarise(., mnEarn=mean(earnings),
+                sdEarn = sd(earnings),
+                maxEarn = max(earnings),
+                minEarn = min(earnings))
+gc()
+}
+
+```
+
+```{r}
+state.omit <- c("AK", "HI", "DC", "AS", "GU", "MP", "PR", "UM", "VI","FL")
+conus <- fips_codes %>% filter(., !state %in% state.omit) %>% distinct(.$state) %>% c() %>% unlist()
+
+
+tct.earn <- map(conus, function(x){
+  get_earnings_tct(x)
+})
+
